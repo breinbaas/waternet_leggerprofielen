@@ -11,7 +11,7 @@ from geolib.soils import Soil, ShearStrengthModelTypePhreaticLevel
 from geolib.geometry.one import Point
 from geolib.models.dstability.internal import AnalysisTypeEnum, BishopBruteForceResult
 from math import isnan
-from helpers2 import (
+from helpers import (
     case_insensitive_glob,
     surface_of_polygon_collection,
     line_polygon_intersections,

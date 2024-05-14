@@ -1,0 +1,3 @@
+d-geolib
+tqdm
+shapely

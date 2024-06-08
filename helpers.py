@@ -1,6 +1,13 @@
 from typing import List, Tuple
 from pathlib import Path
-from shapely.geometry import Point, LineString, MultiPoint, Polygon
+from shapely.geometry import (
+    Point,
+    LineString,
+    MultiPoint,
+    Polygon,
+    MultiLineString,
+    GeometryCollection,
+)
 from shapely import get_coordinates
 from shapely.ops import unary_union
 from shapely.geometry.polygon import orient
@@ -73,8 +80,11 @@ def line_polygon_intersections(
     elif type(intersections) == Point:
         x, y = intersections.coords.xy
         result.append((x[0], y[0]))
-    elif intersections.is_empty:
-        return []
+    elif type(intersections) == MultiLineString:
+        result = get_coordinates(intersections).tolist()
+    elif type(intersections) == GeometryCollection:
+        geoms = [g for g in intersections.geoms if type(g) != Point]
+        result = get_coordinates(geoms).tolist()
     else:
         raise ValueError(f"Unimplemented intersection type '{type(intersections)}'")
 

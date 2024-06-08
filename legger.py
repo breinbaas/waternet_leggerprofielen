@@ -18,6 +18,7 @@ from helpers import (
     fix_surface_points,
 )
 from shapely import Polygon, get_coordinates
+import matplotlib.pyplot as plt
 
 ### VEREISTEN
 # de karakteristieke punten moeten ingevuld zijn
@@ -25,9 +26,10 @@ from shapely import Polygon, get_coordinates
 #
 
 
-LOG_FILE_LEGGER = r"Z:\Development\Python\waternet_legger\test\output\legger.log"
-PATH_STIX_FILES = r"Z:\Development\Python\waternet_legger\test\input"
-CALCULATIONS_PATH = r"Z:\Development\Python\waternet_legger\test\output\calculations"
+LOG_FILE_LEGGER = r"Z:\Documents\Klanten\Output\Waternet\Legger\legger.log"
+PATH_STIX_FILES = r"Z:\Documents\Klanten\OneDrive\Waternet\Legger\input\berekeningen"
+CALCULATIONS_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\calculations"
+PLOT_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger"
 
 MIN_SLIP_PLANE_LENGTH = 3.0
 MIN_SLIP_PLANE_DEPTH = 2.0
@@ -62,6 +64,7 @@ CREST_WIDTH = 1.5
 REQUIRED_SF = 1.2
 FMIN_MARGIN = 0.1
 POLDERPEIL = -2.0
+EXCAVATION_DEPTH = 2.0
 
 
 def get_soils(dm: DStabilityModel) -> List[Dict]:
@@ -100,6 +103,11 @@ def get_soillayers(dm: DStabilityModel) -> List[Dict]:
         }
         for layer in geometry.Layers
     ]
+
+
+def get_used_soils(dm: DStabilityModel) -> List[Soil]:
+    used_soilcodes = [d["soil"]["code"] for d in get_soillayers(dm)]
+    return [s for s in dm.datastructure.soils.Soils if s.Code in used_soilcodes]
 
 
 def cut(
@@ -177,9 +185,11 @@ def cut(
     # build new model
     dm_new = DStabilityModel()
 
-    # copy all soils
-    added_soilcodes = []
-    for psoil in dm.soils.Soils:
+    # copy all soils that are used
+    # TODO get the used soil materials
+    used_soils = get_used_soils(dm)
+    added_soilcodes = [s.Code for s in dm_new.soils.Soils]
+    for psoil in used_soils:
         if psoil.Code in added_soilcodes:
             continue
 
@@ -250,11 +260,91 @@ def cut(
         )
     else:
         logging.error(f"Unhandled analysis type '{calculation_settings.AnalysisType}'")
+        return None
 
     return dm_new
 
 
-for stix_file in stix_files[:1]:
+def get_natural_slopes_line(
+    dm: DStabilityModel, uittredepunt: Tuple[float, float]
+) -> List[Tuple[float, float]]:
+    result = [uittredepunt]
+    x = uittredepunt[0]
+    geometry = dm._get_geometry(scenario_index=0, stage_index=0)
+    soillayers = get_soillayers(dm)
+    all_points = []
+    for soillayer in soillayers:
+        all_points += soillayer["points"]
+    bottom = min([p[1] for p in all_points])
+    soils = get_soils(dm)
+    layer_soil_dict = {
+        l.LayerId: l.SoilId
+        for l in dm._get_soil_layers(scenario_index=0, stage_index=0).SoilLayers
+    }
+    soillayers = [
+        {
+            "id": layer.Id,
+            "soil": soils[layer_soil_dict[layer.Id]],
+            "points": [(p.X, p.Z) for p in layer.Points],
+        }
+        for layer in geometry.Layers
+    ]
+    # create a slopes dictionary
+    slopes = {}
+    for sl in soillayers:
+        soilcode = sl["soil"]["code"]
+        ys = sl["soil"]["ys"]
+        c = sl["soil"]["cohesion"]
+
+        if soilcode not in slopes.keys():
+            if ys < 12:
+                slopes[soilcode] = 6
+            elif ys > 18:
+                slopes[soilcode] = 4
+            elif c >= 3.0:
+                slopes[soilcode] = 3
+            else:
+                slopes[soilcode] = 4
+
+    all_intersections = []
+    for sl in soillayers:
+        intersections = line_polygon_intersections(
+            (x, top + 1.0), (x, bottom - 1.0), sl["points"]
+        )
+
+        if len(intersections) > 0 and len(intersections) % 2 == 0:
+            for i in range(int(len(intersections) / 2)):
+                all_intersections.append(
+                    {
+                        "top": intersections[i * 2][1],
+                        "bottom": intersections[i * 2 + 1][1],
+                        "slope": slopes[sl["soil"]["code"]],
+                    }
+                )
+
+    # sort all intersections
+    all_intersections = sorted(all_intersections, key=lambda x: x["top"], reverse=True)
+
+    # voeg nu de punten toe obv de helling van de grondsoorten
+    px, pz = x, max([p["top"] for p in all_intersections])
+    for intersection in all_intersections[:-1]:
+        dz = pz - intersection["bottom"]
+        px += dz * intersection["slope"]
+        result.append((px, intersection["bottom"]))
+
+    return result
+
+
+for stix_file in stix_files[:10]:
+    # check of er al een solution bestand is
+    solution_file = Path(CALCULATIONS_PATH) / f"{stix_file.stem}.solution.stix"
+
+    if solution_file.exists():
+        logging.info(
+            f"Skipping {stix_file.stem} because a solution has already been found."
+        )
+        continue
+
     logging.info(f"Handling {stix_file}")
     dm = DStabilityModel()
     dm.parse(Path(stix_file))
@@ -325,21 +415,27 @@ for stix_file in stix_files[:1]:
                 polderpeil=POLDERPEIL,
                 crest_width=CREST_WIDTH,
             )
+
+            if dm_cut is None:
+                logging.error(
+                    "Fout in het genereren van de berekening voor het minimale profiel. Check de log."
+                )
+                break
+
             try:
-                dm_cut.serialize(Path(CALCULATIONS_PATH) / f"test_{slope:.2f}.stix")
+                dm_cut.serialize(
+                    Path(CALCULATIONS_PATH) / f"{stix_file.stem}_slope_{slope:.2f}.stix"
+                )
                 dm_cut.execute()
                 sf = round(dm_cut.get_result(0, 0).FactorOfSafety, 2)
+                logging.info(
+                    f"Bij een helling van 1:{slope:.2f} is de veiligheidsfactor {sf:.3f}."
+                )
             except Exception as e:
                 logging.error(
                     f"Fout bij het berekenen van de berm met helling 1:{slope:.2f}; '{e}'"
                 )
                 continue
-
-            if slope == 1.0 and sf > REQUIRED_SF:
-                logging.info(
-                    "Het absolute minimale profiel heeft al voldoende veiligheid, we deze niet verder minimaliseren."
-                )
-                break
 
             if sf < REQUIRED_SF or sf > REQUIRED_SF + FMIN_MARGIN:
                 slope *= (REQUIRED_SF / sf) * 1.1
@@ -350,17 +446,60 @@ for stix_file in stix_files[:1]:
             logging.info(
                 "Na het maximale aantal iteraties is er nog geen oplossing gekomen waarbij voldaan wordt aan de vereiste veiligheidsfactor met marge."
             )
-        else:
-            logging.info(f"Er is een oplossing gevonden met helling 1:{slope:.2f}")
-            uittredepunt = get_uittredepunt(dm=dm_cut)
-            # TODO maak hellingen conform grondopbouw
-            # buitenbeschermings zone = raaklijn voorgaande helling met 2m ontgraving tov maaiveld
-            # opdrijven berekenen
-            # en veiligheid SF > SF;eis
-            # of opschuiven bak
-            # opdrijfveiligheid < 1.1 geen buitenbeschermingszone
-            # maar beschermingszone
-            # wel opdrijfveiligheid >= 1.1 dan beschermingszone vanaf zijkant bak
+            continue
+
+        if dm_cut is None:
+            logging.error(
+                "Er is een fout aangetroffen waardoor dit bestand niet berekend kan worden."
+            )
+            continue
+
+        logging.info(f"Er is een oplossing gevonden met helling 1:{slope:.2f}")
+        dm_cut.serialize(solution_file)
+
+        fig, ax = plt.subplots(figsize=(15, 5))
+        # create the line of the surface
+        ax.plot([p[0] for p in dm_cut.surface], [p[1] for p in dm_cut.surface], "k")
+
+        uittredepunt = get_uittredepunt(dm=dm_cut)
+        # maak hellingen conform grondopbouw op uittredepunt
+        slopes_line = get_natural_slopes_line(dm_cut, uittredepunt)
+        ax.plot([p[0] for p in slopes_line], [p[1] for p in slopes_line], "k--")
+
+        excavation_level = POLDERPEIL - EXCAVATION_DEPTH
+        start_excavation = left
+        for i in range(1, len(slopes_line)):
+            x1, z1 = slopes_line[i - 1]
+            x2, z2 = slopes_line[i]
+
+            if z1 >= excavation_level and excavation_level >= z2:
+                start_excavation = x1 + (z1 - excavation_level) / (z1 - z2) * (x2 - x1)
+                ax.plot(
+                    [start_excavation, start_excavation],
+                    [POLDERPEIL, excavation_level],
+                    "k--",
+                )
+                logging.info(
+                    f"Het begin van de ontgravingsbak van {EXCAVATION_DEPTH:.2f}m ligt op x={start_excavation:.2f},z={excavation_level:.2f}"
+                )
+                break
+
+        if start_excavation == left:
+            logging.info(
+                f"Geen snijpunt gevonden met de lijn van de grondsoorten en de ontgravingsbak."
+            )
+            continue
+
+        fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}.png")
+
+        # buitenbeschermings zone = raaklijn voorgaande helling met 2m ontgraving tov maaiveld
+
+        # opdrijven berekenen
+        # en veiligheid SF > SF;eis
+        # of opschuiven bak
+        # opdrijfveiligheid < 1.1 geen buitenbeschermingszone
+        # maar beschermingszone
+        # wel opdrijfveiligheid >= 1.1 dan beschermingszone vanaf zijkant bak
 
     # # get the characteristic points
     # # we need the waternet creator

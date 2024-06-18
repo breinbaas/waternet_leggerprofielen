@@ -1,5 +1,5 @@
 import logging
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from pathlib import Path
 from geolib.models.dstability import DStabilityModel
 from geolib.models.dstability.analysis import (
@@ -51,6 +51,9 @@ logging.info(
     f"De afstand tussen de freatische lijn en het maaiveld is ingesteld op {PL_SURFACE_OFFSET} meter"
 )
 logging.info(
+    f"De afstand tussen MHW en de waterstand onder de buitenkruinlijn is ingesteld op {OFFSET_B} meter"
+)
+logging.info(
     f"NB. Er wordt GEEN rekening gehouden met het verloop van de stijghoogte naar de freatische lijn."
 )
 
@@ -60,11 +63,13 @@ stix_files = case_insensitive_glob(PATH_STIX_FILES, ".stix")
 # TODO
 # dth, kruinbreedte, polderpeil bepalen obv data
 DTH = 0.1
-CREST_WIDTH = 1.5
-REQUIRED_SF = 1.2
+CREST_WIDTH = 3.0
+REQUIRED_SF = 1.0
 FMIN_MARGIN = 0.1
 POLDERPEIL = -2.0
 EXCAVATION_DEPTH = 2.0
+
+FORCE_RECALCULATION = False
 
 
 def get_soils(dm: DStabilityModel) -> List[Dict]:
@@ -335,11 +340,124 @@ def get_natural_slopes_line(
     return result
 
 
+def maximize_levee(dm: DStabilityModel, sf: float) -> Optional[DStabilityModel]:
+    logging.info(
+        "Methode om een dijk met te lage stab factor te laten voldoen is nog niet ingebouwd."
+    )
+    return None
+
+
+def minimize_levee(dm: DStabilityModel, sf: float) -> Optional[DStabilityModel]:
+    """Minimaliseren van het dijkprofiel
+
+    Dit gebeurt door een lijn te trekken vanaf het referentiepunt, 3m naar de polder (instelbaar via CREST_WIDTH)
+    (hoogteschermen (waarbij 1.5m moet worden toegepast) worden genegeerd omdat we dit
+    niet kunnen achterhalen) en een aangenomen helling te volgen tot de volgende diepte;
+
+    Is er een sloot aanwezig?
+    Ja -> afsnoepen tot een niveau van sloot landzijde
+    Nee -> afsnoepen tot een niveau van het laatste punt van het maaiveld
+
+    Als de stabiliteitsfactor te hoog is wordt de helling steiler gemaakt en vice
+    versa. Dit gaat door tot een oplossing is gevonden of tot een maximum van 10
+    iteraties niet tot een oplossing heeft geleid.
+
+    Args:
+        dm (DStabilityModel): _description_
+        sf (float): _description_
+
+    Returns:
+        bool: _description_
+    """
+    slope = 1.0
+    iterations = 0
+
+    # gebruik het laatste punt van de surface als polderpeil
+    z_polderpeil = dm.surface[-1][1]
+    # als we een sloot hebben gebruikt dan het hoge punt aan de landzijde als polderniveau
+    if dm.datastructure.scenarios[0].Stages[0].WaternetCreatorSettingsId is not None:
+        for wn in dm.datastructure.waternetcreatorsettings:
+            if (
+                wn.Id
+                == dm.datastructure.scenarios[0].Stages[0].WaternetCreatorSettingsId
+            ):
+                wnetcreator_settings = wn
+                break
+
+        try:
+            Ix = wnetcreator_settings.DitchCharacteristics.DitchLandSide
+            z_polderpeil - dm.z_at(Ix)
+        except Exception as e:
+            logging.info("No ditch land side point found.")
+
+    logging.info(
+        f"We gebruiken bij het minimaliseren van het profiel {z_polderpeil:.2f} als ontgravingspeil voor deze berekening"
+    )
+
+    while (
+        sf < REQUIRED_SF
+        or sf > REQUIRED_SF + FMIN_MARGIN
+        and iterations < MAX_ITERATIONS
+    ):
+
+        dm_cut = cut(
+            dm,
+            slope=slope,
+            mhw=DTH - 0.1,
+            dth=DTH,
+            polderpeil=POLDERPEIL,
+            crest_width=CREST_WIDTH,
+        )
+
+        if dm_cut is None:
+            logging.error(
+                "Fout in het genereren van de berekening voor het minimale profiel. Check de log."
+            )
+            break
+
+        try:
+            dm_cut.serialize(
+                Path(CALCULATIONS_PATH) / f"{stix_file.stem}_slope_{slope:.2f}.stix"
+            )
+            dm_cut.execute()
+            sf = round(dm_cut.get_result(0, 0).FactorOfSafety, 2)
+            logging.info(
+                f"Bij een helling van 1:{slope:.2f} is de veiligheidsfactor {sf:.3f}."
+            )
+        except Exception as e:
+            logging.error(
+                f"Fout bij het berekenen van de berm met helling 1:{slope:.2f}; '{e}'"
+            )
+            continue
+
+        if sf < REQUIRED_SF or sf > REQUIRED_SF + FMIN_MARGIN:
+            slope *= (REQUIRED_SF / sf) * 1.1
+
+        iterations += 1
+
+    if iterations == MAX_ITERATIONS:
+        logging.info(
+            "Na het maximale aantal iteraties is er nog geen oplossing gekomen waarbij voldaan wordt aan de vereiste veiligheidsfactor met marge."
+        )
+        return None
+
+    if dm_cut is None:
+        logging.error(
+            "Er is een fout aangetroffen waardoor dit bestand niet berekend kan worden."
+        )
+        return None
+
+    logging.info(f"Er is een oplossing gevonden met helling 1:{slope:.2f}")
+    dm_cut.serialize(solution_file)
+
+    return dm_cut
+
+
 for stix_file in stix_files[:10]:
     # check of er al een solution bestand is
     solution_file = Path(CALCULATIONS_PATH) / f"{stix_file.stem}.solution.stix"
 
-    if solution_file.exists():
+    if solution_file.exists() and not FORCE_RECALCULATION:
         logging.info(
             f"Skipping {stix_file.stem} because a solution has already been found."
         )
@@ -392,114 +510,68 @@ for stix_file in stix_files[:10]:
         logging.info(
             f"De huidige veilgheidsfactor {sf:.2f} is lager dan de vereiste veiligheidsfactor ({REQUIRED_SF:.2f})"
         )
-        continue
-
-    if sf > REQUIRED_SF + FMIN_MARGIN:
+        dm = maximize_levee(dm, sf)
+        if dm is None:
+            logging.info(
+                "Het is niet gelukt om de dijk te laten voldoen aan de vereiste veiligheidsfactor, zie bovenstaande log entries."
+            )
+            continue
+    elif sf > REQUIRED_SF + FMIN_MARGIN:
         logging.info(
             f"De huidige veiligheidsfactor ({sf:.2f}) is groter dan de vereiste veiligheids factor + marge ({(REQUIRED_SF + FMIN_MARGIN):.2f}) wat aangeeft dat de dijk overgedimensioneerd is."
         )
         logging.info("Proces om de dijk af te minimaliseren is begonnen...")
 
-        slope = 1.0
-        iterations = 0
-        while (
-            sf < REQUIRED_SF
-            or sf > REQUIRED_SF + FMIN_MARGIN
-            and iterations < MAX_ITERATIONS
-        ):
-            dm_cut = cut(
-                dm,
-                slope=slope,
-                mhw=DTH - 0.1,
-                dth=DTH,
-                polderpeil=POLDERPEIL,
-                crest_width=CREST_WIDTH,
-            )
+        dm = minimize_levee(dm, sf)
 
-            if dm_cut is None:
-                logging.error(
-                    "Fout in het genereren van de berekening voor het minimale profiel. Check de log."
-                )
-                break
-
-            try:
-                dm_cut.serialize(
-                    Path(CALCULATIONS_PATH) / f"{stix_file.stem}_slope_{slope:.2f}.stix"
-                )
-                dm_cut.execute()
-                sf = round(dm_cut.get_result(0, 0).FactorOfSafety, 2)
-                logging.info(
-                    f"Bij een helling van 1:{slope:.2f} is de veiligheidsfactor {sf:.3f}."
-                )
-            except Exception as e:
-                logging.error(
-                    f"Fout bij het berekenen van de berm met helling 1:{slope:.2f}; '{e}'"
-                )
-                continue
-
-            if sf < REQUIRED_SF or sf > REQUIRED_SF + FMIN_MARGIN:
-                slope *= (REQUIRED_SF / sf) * 1.1
-
-            iterations += 1
-
-        if iterations == MAX_ITERATIONS:
+        if dm is None:
             logging.info(
-                "Na het maximale aantal iteraties is er nog geen oplossing gekomen waarbij voldaan wordt aan de vereiste veiligheidsfactor met marge."
+                "Het is niet gelukt om de dijk te minimaliseren, zie bovenstaande log entries."
             )
             continue
 
-        if dm_cut is None:
-            logging.error(
-                "Er is een fout aangetroffen waardoor dit bestand niet berekend kan worden."
+    fig, ax = plt.subplots(figsize=(15, 5))
+    # create the line of the surface
+    ax.plot([p[0] for p in dm.surface], [p[1] for p in dm.surface], "k")
+
+    uittredepunt = get_uittredepunt(dm=dm)
+    # maak hellingen conform grondopbouw op uittredepunt
+    slopes_line = get_natural_slopes_line(dm, uittredepunt)
+    ax.plot([p[0] for p in slopes_line], [p[1] for p in slopes_line], "k--")
+
+    excavation_level = POLDERPEIL - EXCAVATION_DEPTH
+    start_excavation = left
+    for i in range(1, len(slopes_line)):
+        x1, z1 = slopes_line[i - 1]
+        x2, z2 = slopes_line[i]
+
+        if z1 >= excavation_level and excavation_level >= z2:
+            start_excavation = x1 + (z1 - excavation_level) / (z1 - z2) * (x2 - x1)
+            ax.plot(
+                [start_excavation, start_excavation],
+                [POLDERPEIL, excavation_level],
+                "k--",
             )
-            continue
-
-        logging.info(f"Er is een oplossing gevonden met helling 1:{slope:.2f}")
-        dm_cut.serialize(solution_file)
-
-        fig, ax = plt.subplots(figsize=(15, 5))
-        # create the line of the surface
-        ax.plot([p[0] for p in dm_cut.surface], [p[1] for p in dm_cut.surface], "k")
-
-        uittredepunt = get_uittredepunt(dm=dm_cut)
-        # maak hellingen conform grondopbouw op uittredepunt
-        slopes_line = get_natural_slopes_line(dm_cut, uittredepunt)
-        ax.plot([p[0] for p in slopes_line], [p[1] for p in slopes_line], "k--")
-
-        excavation_level = POLDERPEIL - EXCAVATION_DEPTH
-        start_excavation = left
-        for i in range(1, len(slopes_line)):
-            x1, z1 = slopes_line[i - 1]
-            x2, z2 = slopes_line[i]
-
-            if z1 >= excavation_level and excavation_level >= z2:
-                start_excavation = x1 + (z1 - excavation_level) / (z1 - z2) * (x2 - x1)
-                ax.plot(
-                    [start_excavation, start_excavation],
-                    [POLDERPEIL, excavation_level],
-                    "k--",
-                )
-                logging.info(
-                    f"Het begin van de ontgravingsbak van {EXCAVATION_DEPTH:.2f}m ligt op x={start_excavation:.2f},z={excavation_level:.2f}"
-                )
-                break
-
-        if start_excavation == left:
             logging.info(
-                f"Geen snijpunt gevonden met de lijn van de grondsoorten en de ontgravingsbak."
+                f"Het begin van de ontgravingsbak van {EXCAVATION_DEPTH:.2f}m ligt op x={start_excavation:.2f},z={excavation_level:.2f}"
             )
-            continue
+            break
 
-        fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}.png")
+    if start_excavation == left:
+        logging.info(
+            f"Geen snijpunt gevonden met de lijn van de grondsoorten en de ontgravingsbak."
+        )
+        continue
 
-        # buitenbeschermings zone = raaklijn voorgaande helling met 2m ontgraving tov maaiveld
+    fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}.png")
+    # buitenbeschermings zone = raaklijn voorgaande helling met 2m ontgraving tov maaiveld
 
-        # opdrijven berekenen
-        # en veiligheid SF > SF;eis
-        # of opschuiven bak
-        # opdrijfveiligheid < 1.1 geen buitenbeschermingszone
-        # maar beschermingszone
-        # wel opdrijfveiligheid >= 1.1 dan beschermingszone vanaf zijkant bak
+    # opdrijven berekenen
+    # en veiligheid SF > SF;eis
+    # of opschuiven bak
+    # opdrijfveiligheid < 1.1 geen buitenbeschermingszone
+    # maar beschermingszone
+    # wel opdrijfveiligheid >= 1.1 dan beschermingszone vanaf zijkant bak
 
     # # get the characteristic points
     # # we need the waternet creator

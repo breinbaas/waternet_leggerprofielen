@@ -1,11 +1,16 @@
 from pydantic import BaseModel
 from typing import List, Tuple, Dict
 from shapely import Polygon, MultiPolygon, get_coordinates, unary_union
+from math import isnan
 
 from geolib.models.dstability import DStabilityModel
 from geolib.soils.soil import Soil
 from geolib.geometry.one import Point
-from geolib.models.dstability.internal import AnalysisTypeEnum, CharacteristicPointEnum
+from geolib.models.dstability.internal import (
+    AnalysisTypeEnum,
+    CharacteristicPointEnum,
+    ShearStrengthModelTypePhreaticLevelInternal,
+)
 from geolib.models.dstability.analysis import (
     DStabilityBishopBruteForceAnalysisMethod,
     DStabilitySearchGrid,
@@ -28,18 +33,20 @@ class SoilPolygon(BaseModel):
 
 class DStabilityModelModifier(BaseModel):
     dm: DStabilityModel = DStabilityModel()
+    soils: List[Soil] = []
     soil_polygons: List[SoilPolygon] = []
     phreatic_line: List[Tuple[float, float]] = []
     scenario_index: int = 0
     stage_index: int = 0
     calculation_index: int = 0
-    phreatic_line_offset: float = 0.25
-    x_top_water_side: float = None
-    polder_level: float
+    # phreatic_line_offset: float = 0.25
+    # x_top_water_side: float = None
+    # polder_level: float
 
     @classmethod
     def from_file(
-        cls, filename: str, polder_level: float, x_top_water_side: float = None
+        cls,
+        filename: str,
     ) -> "DStabilityModelModifier":
         """Create a DStabilityModelModifier from a stix file
 
@@ -50,11 +57,90 @@ class DStabilityModelModifier(BaseModel):
             DStabilityModelModifier: The DStabilityModifier based on the given file
         """
         result = DStabilityModelModifier(
-            x_top_water_side=x_top_water_side, polder_level=polder_level
+            # x_top_water_side=x_top_water_side, polder_level=polder_level
         )
         result.dm.parse(filename)
         result.initialize()
         return result
+
+    def initialize(self):
+        """Update the model from the given DStabilityModel"""
+        geometry = self.dm._get_geometry(
+            scenario_index=self.scenario_index, stage_index=self.stage_index
+        )
+
+        soils = self._get_soils()
+
+        for psoil in self.dm.soils.Soils:
+            soil = self.dm.soils.get_global_soil(psoil.Code)
+
+            if (
+                psoil.ShearStrengthModelTypeBelowPhreaticLevel
+                == ShearStrengthModelTypePhreaticLevelInternal.MOHR_COULOMB_CLASSIC
+            ):
+                if isnan(psoil.MohrCoulombClassicShearStrengthModel.Cohesion):
+                    continue
+
+                soil.soil_weight_parameters.unsaturated_weight = (
+                    psoil.VolumetricWeightAbovePhreaticLevel
+                )
+                soil.soil_weight_parameters.saturated_weight = (
+                    psoil.VolumetricWeightBelowPhreaticLevel
+                )
+                soil.mohr_coulomb_parameters.cohesion = (
+                    psoil.MohrCoulombClassicShearStrengthModel.Cohesion
+                )
+                soil.mohr_coulomb_parameters.friction_angle = (
+                    psoil.MohrCoulombClassicShearStrengthModel.FrictionAngle
+                )
+                # assume the friction angle equals to the friction angle
+                soil.mohr_coulomb_parameters.dilatancy_angle = (
+                    psoil.MohrCoulombClassicShearStrengthModel.FrictionAngle
+                )
+            elif (
+                psoil.ShearStrengthModelTypeBelowPhreaticLevel
+                == ShearStrengthModelTypePhreaticLevelInternal.MOHR_COULOMB_ADVANCED
+            ):
+                if isnan(psoil.MohrCoulombAdvancedShearStrengthModel.Cohesion):
+                    continue
+
+                soil.soil_weight_parameters.unsaturated_weight = (
+                    psoil.VolumetricWeightAbovePhreaticLevel
+                )
+                soil.soil_weight_parameters.saturated_weight = (
+                    psoil.VolumetricWeightBelowPhreaticLevel
+                )
+                soil.mohr_coulomb_parameters.cohesion = (
+                    psoil.MohrCoulombAdvancedShearStrengthModel.Cohesion
+                )
+                soil.mohr_coulomb_parameters.friction_angle = (
+                    psoil.MohrCoulombAdvancedShearStrengthModel.FrictionAngle
+                )
+                # assume the friction angle equals to the friction angle
+                soil.mohr_coulomb_parameters.dilatancy_angle = (
+                    psoil.MohrCoulombAdvancedShearStrengthModel.Dilatancy
+                )
+            self.soils.append(soil)
+
+        # get the phreatic line
+        if self.dm.phreatic_line is not None:
+            self.phreatic_line = [(p.X, p.Z) for p in self.dm.phreatic_line().Points]
+
+        # grondlaag connecties met grondsoorten
+        layer_soil_dict = {
+            l.LayerId: l.SoilId
+            for l in self.dm._get_soil_layers(
+                scenario_index=self.scenario_index, stage_index=self.stage_index
+            ).SoilLayers
+        }
+
+        self.soil_polygons = [
+            SoilPolygon(
+                points=[(p.X, p.Z) for p in layer.Points],
+                soilcode=soils[layer_soil_dict[layer.Id]]["code"],
+            )
+            for layer in geometry.Layers
+        ]
 
     def set_scenario_stage_calculation_index(
         self, scenario_index: int = 0, stage_index: int = 0, calculation_index: int = 0
@@ -85,10 +171,12 @@ class DStabilityModelModifier(BaseModel):
             ValueError: Will raise an error if an invalid polygon calculation is found
         """
         zmax = max(line[0][1], max([p[1] for p in self.dm.surface]) + 1.0)
-        line.append((line[-1][0], zmax))
-        line.append((line[0][0], zmax))
 
-        pg_extract = Polygon(line)
+        cut_line = [p for p in line]
+        cut_line.append((line[-1][0], zmax))
+        cut_line.append((line[0][0], zmax))
+
+        pg_extract = Polygon(cut_line)
         new_soil_polygons = []
         for spg in self.soil_polygons:
             pg = spg.shapely_polygon
@@ -110,28 +198,24 @@ class DStabilityModelModifier(BaseModel):
 
         self.soil_polygons = new_soil_polygons
 
-        if adjust_phreatic_line:
-            self.adjust_phreatic_level()
-
-    def fill(
-        self,
-        soil_code: str,
-        line: List[Tuple[float, float]],
-        adjust_phreatic_line: bool = True,
-    ):
+    def fill(self, line: List[Tuple[float, float]], soil_code: str):
         """Fill the geometry from the given line with the given material. The line should be defined from left
         to right. A point will be added to the start and end of the line if that point is above the surface
 
         Args:
             soil_code (str): The soilcode to use for the fill material (should already be present in the availabale soils)
             line (List[Tuple[float, float]]): The line to use for the fill
-            adjust_phreatic_line (bool, optional): Adjust the phreatic line after the change. Defaults to False.
+
 
         Raises:
             ValueError: Raises an error if the soilcode is not found or if an invalid polygon calculation is found
         """
-        if not soil_code in [d["code"] for d in self._get_soils().values()]:
-            raise ValueError(f"Unknown soilcode '{soil_code}'")
+        # TEST
+        fill_line = [p for p in line]
+
+        # add the soil unless it is already available
+        if not soil_code in [s.code for s in self.soils]:
+            raise ValueError(f"Soilcode '{soil_code}' for fill not found. Add it first")
 
         merged_polygon = unary_union(
             [spg.shapely_polygon for spg in self.soil_polygons]
@@ -145,12 +229,12 @@ class DStabilityModelModifier(BaseModel):
         surfacepoints = [p for p in self.dm.surface if p[0] >= xmin and p[0] <= xmax]
         zmin = min([p[1] for p in surfacepoints]) - 0.1  # add small offset
 
-        if line[-1][1] > zmin:
-            line.append((line[-1][0], zmin))
+        if fill_line[-1][1] > zmin:
+            fill_line.append((fill_line[-1][0], zmin))
         if line[0][-1] > zmin:
-            line.append((line[0][0], zmin))
+            fill_line.append((fill_line[0][0], zmin))
 
-        pgfill = Polygon(line)
+        pgfill = Polygon(fill_line)
 
         pgs = pgfill.difference(merged_polygon)
 
@@ -162,15 +246,120 @@ class DStabilityModelModifier(BaseModel):
             raise ValueError(f"Unhandled polygon difference type '{type(pgs)}'")
 
         for geom in geoms:
-            points = list(geom.exterior.coords)[:-1]
-            self.soil_polygons.append(SoilPolygon(points=points, soilcode=soil_code))
+            if (
+                geom.area > 0.1
+            ):  # it is possible that really small layers will be added because of rounding errors, by checking the area for a min size we avoid these layers
+                points = list(geom.exterior.coords)[:-1]
+                self.soil_polygons.append(
+                    SoilPolygon(points=points, soilcode=soil_code)
+                )
 
-        if adjust_phreatic_line:
-            self.adjust_phreatic_level()
+        # if adjust_phreatic_line:
+        #     self.adjust_phreatic_level()
 
-    def to_dstability_model(
+    def to_dstability_model_with_autogenerated_settings(
         self,
-    ) -> DStabilityModel:
+        point_ref: Tuple[float, float],
+        point_crest_land: Tuple[float, float],
+        point_toe: Tuple[float, float],
+        ditch_points: List[Tuple[float, float]],
+    ):
+        dm = self.to_dstability_model()
+        # generate calculation settings
+        settings = self.dm._get_calculation_settings(
+            self.scenario_index, self.calculation_index
+        )
+
+        if (
+            settings is not None
+            or settings.AnalysisType == AnalysisTypeEnum.BISHOP_BRUTE_FORCE
+        ):
+            dm.set_model(
+                DStabilityBishopBruteForceAnalysisMethod(
+                    search_grid=DStabilitySearchGrid(
+                        bottom_left=Point(
+                            x=(point_ref[0] + point_crest_land[0]) / 2.0,
+                            z=dm.z_at((point_ref[0] + point_crest_land[0]) / 2.0) + 1.0,
+                        ),
+                        number_of_points_in_x=20,
+                        number_of_points_in_z=10,
+                        space=0.5,
+                    ),
+                    bottom_tangent_line_z=point_toe[1] - 5.0,
+                    number_of_tangent_lines=10,
+                    space_tangent_lines=0.5,
+                    slip_plane_constraints=DStabilitySlipPlaneConstraints(
+                        is_size_constraints_enabled=True,
+                        # is_zone_a_constraints_enabled=settings.BishopBruteForce.SlipPlaneConstraints.IsZoneAConstraintsEnabled,
+                        # is_zone_b_constraints_enabled=settings.BishopBruteForce.SlipPlaneConstraints.IsZoneBConstraintsEnabled,
+                        minimum_slip_plane_depth=2.0,
+                        minimum_slip_plane_length=3.0,
+                        # width_zone_a=settings.BishopBruteForce.SlipPlaneConstraints.WidthZoneA,
+                        # width_zone_b=settings.BishopBruteForce.SlipPlaneConstraints.WidthZoneB,
+                        # x_left_zone_a=settings.BishopBruteForce.SlipPlaneConstraints.XLeftZoneA,
+                        # x_left_zone_b=settings.BishopBruteForce.SlipPlaneConstraints.XLeftZoneB,
+                    ),
+                )
+            )
+        elif settings.AnalysisType == AnalysisTypeEnum.SPENCER_GENETIC:
+            dm.set_model(
+                DStabilityBishopBruteForceAnalysisMethod(
+                    search_grid=DStabilitySearchGrid(
+                        bottom_left=Point(
+                            x=(point_ref[0] + point_crest_land[0]) / 2.0,
+                            z=dm.z_at((point_ref[0] + point_crest_land[0]) / 2.0) + 1.0,
+                        ),
+                        number_of_points_in_x=20,
+                        number_of_points_in_z=10,
+                        space=0.5,
+                    ),
+                    bottom_tangent_line_z=point_crest_land[1],
+                    number_of_tangent_lines=10,
+                    space_tangent_lines=0.5,
+                    slip_plane_constraints=DStabilitySlipPlaneConstraints(
+                        is_size_constraints_enabled=True,
+                        # is_zone_a_constraints_enabled=settings.BishopBruteForce.SlipPlaneConstraints.IsZoneAConstraintsEnabled,
+                        # is_zone_b_constraints_enabled=settings.BishopBruteForce.SlipPlaneConstraints.IsZoneBConstraintsEnabled,
+                        minimum_slip_plane_depth=2.0,
+                        minimum_slip_plane_length=3.0,
+                        # width_zone_a=settings.BishopBruteForce.SlipPlaneConstraints.WidthZoneA,
+                        # width_zone_b=settings.BishopBruteForce.SlipPlaneConstraints.WidthZoneB,
+                        # x_left_zone_a=settings.BishopBruteForce.SlipPlaneConstraints.XLeftZoneA,
+                        # x_left_zone_b=settings.BishopBruteForce.SlipPlaneConstraints.XLeftZoneB,
+                    ),
+                )
+            )
+        elif settings.AnalysisType == AnalysisTypeEnum.UPLIFT_VAN_PARTICLE_SWARM:
+            dm.set_model(
+                DStabilityBishopBruteForceAnalysisMethod(
+                    search_grid=DStabilitySearchGrid(
+                        bottom_left=Point(
+                            x=(point_ref[0] + point_crest_land[0]) / 2.0,
+                            z=dm.z_at((point_ref[0] + point_crest_land[0]) / 2.0) + 1.0,
+                        ),
+                        number_of_points_in_x=20,
+                        number_of_points_in_z=10,
+                        space=0.5,
+                    ),
+                    bottom_tangent_line_z=point_crest_land[1],
+                    number_of_tangent_lines=10,
+                    space_tangent_lines=0.5,
+                    slip_plane_constraints=DStabilitySlipPlaneConstraints(
+                        is_size_constraints_enabled=True,
+                        # is_zone_a_constraints_enabled=settings.BishopBruteForce.SlipPlaneConstraints.IsZoneAConstraintsEnabled,
+                        # is_zone_b_constraints_enabled=settings.BishopBruteForce.SlipPlaneConstraints.IsZoneBConstraintsEnabled,
+                        minimum_slip_plane_depth=2.0,
+                        minimum_slip_plane_length=3.0,
+                        # width_zone_a=settings.BishopBruteForce.SlipPlaneConstraints.WidthZoneA,
+                        # width_zone_b=settings.BishopBruteForce.SlipPlaneConstraints.WidthZoneB,
+                        # x_left_zone_a=settings.BishopBruteForce.SlipPlaneConstraints.XLeftZoneA,
+                        # x_left_zone_b=settings.BishopBruteForce.SlipPlaneConstraints.XLeftZoneB,
+                    ),
+                )
+            )
+        return dm
+
+    def to_dstability_model(self) -> DStabilityModel:
         """Generate a DStability model from the modifier
 
         Returns:
@@ -180,27 +369,9 @@ class DStabilityModelModifier(BaseModel):
 
         # copy the soils
         # NOTE this will only work for the MC model
-        for psoil in self.dm.soils.Soils:
-            soil = self.dm.soils.get_global_soil(psoil.Code)
-
+        # soils that have a different model are not copied
+        for soil in self.soils:
             if not dm.soils.has_soil_code(soil.code):
-                soil.soil_weight_parameters.unsaturated_weight = (
-                    psoil.VolumetricWeightAbovePhreaticLevel
-                )
-                soil.soil_weight_parameters.saturated_weight = (
-                    psoil.VolumetricWeightBelowPhreaticLevel
-                )
-                soil.mohr_coulomb_parameters.cohesion = (
-                    psoil.MohrCoulombClassicShearStrengthModel.Cohesion
-                )
-                soil.mohr_coulomb_parameters.friction_angle = (
-                    psoil.MohrCoulombClassicShearStrengthModel.FrictionAngle
-                )
-                # assume the friction angle equals to the friction angle
-                soil.mohr_coulomb_parameters.dilatancy_angle = (
-                    psoil.MohrCoulombAdvancedShearStrengthModel.Dilatancy
-                )
-
                 dm.add_soil(soil)
 
         # create the layers
@@ -216,10 +387,20 @@ class DStabilityModelModifier(BaseModel):
                     label="PL 1",
                 )
 
-        # copy the calculation
+        # create the phreatic line
+        dm.add_head_line(
+            points=[Point(x=p[0], z=p[1]) for p in self.phreatic_line],
+            label="PL 1",
+            is_phreatic_line=True,
+        )
+
+        #################################################
+        # THE NEXT CODE WILL COPY THE ORIGINAL SETTINGS #
+        #################################################
         settings = self.dm._get_calculation_settings(
             self.scenario_index, self.calculation_index
         )
+
         if settings is not None:
             if settings.AnalysisType == AnalysisTypeEnum.BISHOP_BRUTE_FORCE:
                 dm.set_model(
@@ -308,70 +489,73 @@ class DStabilityModelModifier(BaseModel):
         """Reset all adjustments"""
         self.initialize()
 
-    def adjust_phreatic_level(
-        self,
-        adjust_ditch: bool = False,
-        ditch_points: List[Tuple[float, float]] = [],
-    ):
-        """Adjust the phreatic line to the new surface, if ditch points are defined in the Waternet creator this will
-        follow the ditch and allow the waterline to be above the surface between the ditch boundaries
-
-        Args:
-            x_top_water_side (float, optional): The x coordinate of the top of the levee on the water side, if not given this will be extracted from the Waternet creator settings. Before this coordinate the waterline can be above the surface level
-            ditch_points (List[Tuple[float, float]], optional): Used defined ditch points. Defaults to []
-
-        Raises:
-            ValueError: If no x_top_water_side is defined and it cannot be found in the Waternet Creator settings an error will be raised
-        """
-        temp_dm = self.to_dstability_model()
-        new_surface = [p for p in temp_dm.surface if p[0] > self.x_top_water_side]
-
-        if len(self.dm.ditch_points) > 0 and len(ditch_points) == 0:
-            ditch_points = self.dm.ditch_points
-
-        if self.x_top_water_side is None:
-            raise ValueError(
-                "This model does not have a waternet creator setting for the embankment top water side which is needed for the phreatic line algorithm to work."
-            )
-
-        # copy all points before x_top_water_side
-        points = [
-            p
-            for p in [
-                (p.X, p.Z)
-                for p in self.dm.phreatic_line(
-                    self.scenario_index, self.stage_index
-                ).Points
-            ]
-            if p[0] <= self.x_top_water_side
-        ]
-
-        ditch_added = False
-        for p in new_surface:
-            # use last points z coord
-            pl_z = points[-1][1]
-            surface_z = temp_dm.z_at(p[0])
-
-            if surface_z is None:
-                continue
-
-            pl_z = min(pl_z, surface_z - self.phreatic_line_offset)
-
-            # but keep the offset from the surface line unless we are at the ditch
-            if len(ditch_points) > 0 and adjust_ditch:
-                if ditch_points[0][0] <= p[0] and p[0] <= ditch_points[-1][0]:
-                    if not ditch_added:
-                        points.append((ditch_points[0][0], pl_z))
-                        points.append((ditch_points[1][0], self.polder_level))
-                        points.append((ditch_points[2][0], self.polder_level))
-                        points.append((ditch_points[3][0], pl_z))
-                        ditch_added = True
-                    else:
-                        continue
-            else:
-                points.append((p[0], pl_z))
-
+    def set_phreatic_line(self, points: List[Tuple[float, float]]):
         self.phreatic_line = points
+
+    # def adjust_phreatic_level(
+    #     self,
+    #     adjust_ditch: bool = False,
+    #     ditch_points: List[Tuple[float, float]] = [],
+    # ):
+    #     """Adjust the phreatic line to the new surface, if ditch points are defined in the Waternet creator this will
+    #     follow the ditch and allow the waterline to be above the surface between the ditch boundaries
+
+    #     Args:
+    #         x_top_water_side (float, optional): The x coordinate of the top of the levee on the water side, if not given this will be extracted from the Waternet creator settings. Before this coordinate the waterline can be above the surface level
+    #         ditch_points (List[Tuple[float, float]], optional): Used defined ditch points. Defaults to []
+
+    #     Raises:
+    #         ValueError: If no x_top_water_side is defined and it cannot be found in the Waternet Creator settings an error will be raised
+    #     """
+    #     temp_dm = self.to_dstability_model()
+    #     new_surface = [p for p in temp_dm.surface if p[0] > self.x_top_water_side]
+
+    #     if len(self.dm.ditch_points) > 0 and len(ditch_points) == 0:
+    #         ditch_points = self.dm.ditch_points
+
+    #     if self.x_top_water_side is None:
+    #         raise ValueError(
+    #             "This model does not have a waternet creator setting for the embankment top water side which is needed for the phreatic line algorithm to work."
+    #         )
+
+    #     # copy all points before x_top_water_side
+    #     points = [
+    #         p
+    #         for p in [
+    #             (p.X, p.Z)
+    #             for p in self.dm.phreatic_line(
+    #                 self.scenario_index, self.stage_index
+    #             ).Points
+    #         ]
+    #         if p[0] <= self.x_top_water_side
+    #     ]
+
+    #     ditch_added = False
+    #     for p in new_surface:
+    #         # use last points z coord
+    #         pl_z = points[-1][1]
+    #         surface_z = temp_dm.z_at(p[0])
+
+    #         if surface_z is None:
+    #             continue
+
+    #         pl_z = min(pl_z, surface_z - self.phreatic_line_offset)
+
+    #         # but keep the offset from the surface line unless we are at the ditch
+    #         if len(ditch_points) > 0 and adjust_ditch:
+    #             if ditch_points[0][0] <= p[0] and p[0] <= ditch_points[-1][0]:
+    #                 if not ditch_added:
+    #                     points.append((ditch_points[0][0], pl_z))
+    #                     points.append((ditch_points[1][0], self.polder_level))
+    #                     points.append((ditch_points[2][0], self.polder_level))
+    #                     points.append((ditch_points[3][0], pl_z))
+    #                     ditch_added = True
+    #                 else:
+    #                     continue
+    #         else:
+    #             points.append((p[0], pl_z))
+
+    #     self.phreatic_line = points
 
     def _get_soils(self) -> List[Dict]:
         """Get the soils in the DStabilityModel as a list of dictionaries with the SoilId as the key
@@ -388,49 +572,9 @@ class DStabilityModelModifier(BaseModel):
             for s in self.dm.datastructure.soils.Soils
         }
 
-    def initialize(self):
-        """Update the model from the given DStabilityModel"""
-        geometry = self.dm._get_geometry(
-            scenario_index=self.scenario_index, stage_index=self.stage_index
-        )
-        soils = self._get_soils()
-
-        # get the phreatic line
-        if self.dm.phreatic_line is not None:
-            self.phreatic_line = [(p.X, p.Z) for p in self.dm.phreatic_line().Points]
-
-        # find the x for the top of the waterside
-        if self.x_top_water_side is None:
-            ref_point = self.dm.get_characteristic_point(
-                CharacteristicPointEnum.EMBANKEMENT_TOP_WATER_SIDE
-            )
-            if ref_point is None:
-                raise ValueError(
-                    "Cannot determine the value for the top of the levee on the water side."
-                )
-            self.x_top_water_side = ref_point.x
-
-        # grondlaag connecties met grondsoorten
-        layer_soil_dict = {
-            l.LayerId: l.SoilId
-            for l in self.dm._get_soil_layers(
-                scenario_index=self.scenario_index, stage_index=self.stage_index
-            ).SoilLayers
-        }
-
-        self.soil_polygons = [
-            SoilPolygon(
-                points=[(p.X, p.Z) for p in layer.Points],
-                soilcode=soils[layer_soil_dict[layer.Id]]["code"],
-            )
-            for layer in geometry.Layers
-        ]
-
 
 if __name__ == "__main__":
-    dsm = DStabilityModelModifier.from_file(
-        "testdata/01.stix", polder_level=-3.0, x_top_water_side=0.0
-    )
+    dsm = DStabilityModelModifier.from_file("testdata/01.stix")
     dm_bishop = dsm.to_dstability_model()
     dm_bishop.serialize("output_bishop.stix")
     dsm.set_scenario_stage_calculation_index(scenario_index=1)

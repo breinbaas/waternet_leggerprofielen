@@ -1,171 +1,52 @@
-# general imports
 import logging
-from geolib.models.dstability import DStabilityModel
 from pathlib import Path
-from typing import Optional
+from geolib.models.dstability import DStabilityModel
+from geolib.models.dstability.dstability_model import CharacteristicPointEnum
+from geolib.models.dstability.internal import (
+    AnalysisTypeEnum,
+    ShearStrengthModelTypePhreaticLevelInternal,
+)
+from geolib.soils.soil import Soil
 import matplotlib.pyplot as plt
+from copy import deepcopy
 
-# local imports
+from helpers import case_insensitive_glob, get_natural_slopes_line
 from dstability_model_modifier import DStabilityModelModifier
-from helpers import case_insensitive_glob
 
-# set to True if the calculation method has changed or else
-# existing solutions will NOT be recalculated
-FORCE_RECALCULATION = True
 
-# file locations for input and output
-LOG_FILE_LEGGER = r"D:\Documents\Klanten\Waternet\LeggerProfielen\Output\Log\legger.log"
-PATH_STIX_FILES = r"D:\Documents\Klanten\Waternet\LeggerProfielen\StixFiles"
-CALCULATIONS_PATH = r"D:\Documents\Klanten\Waternet\LeggerProfielen\Output\Calculations"
-PLOT_PATH = r"D:\Documents\Klanten\Waternet\LeggerProfielen\Output\Plots"
+# set to true if the script / method has changed
+FORCE_RECALCULATION = False
 
-# general calculation settings
+# input paths and files
+PATH_STIX_FILES = (
+    r"Z:\Documents\Klanten\OneDrive\Waternet\Legger\input\berekeningen\A535"
+)
+
+# output paths and files
+LOG_FILE_LEGGER = r"Z:\Documents\Klanten\Output\Waternet\Legger\Log\legger.log"
+CALCULATIONS_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\calculations"
+PLOT_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\Plots"
+CSV_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\csv"
+
+# settings
 MIN_SLIP_PLANE_LENGTH = 3.0
 MIN_SLIP_PLANE_DEPTH = 2.0
 # OFFSET_B = 0.3
 PL_SURFACE_OFFSET = 0.1
-# MAX_ITERATIONS = 10
+INITIAL_SLOPE = 1.0
+MAX_ITERATIONS = 10
+SF_MARGIN = 0.1
 
 # TODO next info should come from shapefiles
-DTH = 0.1
+DTH = -1.8
+RIVER_LEVEL = -2.0
 CREST_WIDTH = 3.0
 REQUIRED_SF = 1.0
 FMIN_MARGIN = 0.1
-POLDERPEIL = -2.0
+POLDER_LEVEL = -5.0
 EXCAVATION_DEPTH = 2.0
 
-# how many iterations do we allow to find a levee that comes close
-# to the required SF? If we do not set this value the process could
-# go on forever
-MAX_ITERATIONS = 10
 
-
-# define the function to maximize or minimize a levee
-def maximize_levee():
-    pass
-
-
-def minimize_levee(
-    dm: DStabilityModel,
-    sf: float,
-    dth: float,
-    crest_width: float,
-    polder_level: float,
-    polder_level_offset: float = 0.1,
-) -> Optional[DStabilityModel]:
-    """Minimaliseren van het dijkprofiel
-
-    Dit gebeurt door een lijn te trekken vanaf het referentiepunt, 3m naar de polder (instelbaar via CREST_WIDTH)
-    (hoogteschermen (waarbij 1.5m moet worden toegepast) worden genegeerd omdat we dit
-    niet kunnen achterhalen) en een aangenomen helling te volgen tot de volgende diepte;
-
-    Is er een sloot aanwezig?
-    Ja -> afsnoepen tot een niveau van sloot landzijde
-    Nee -> afsnoepen tot een niveau van het laatste punt van het maaiveld
-
-    Als de stabiliteitsfactor te hoog is wordt de helling steiler gemaakt en vice
-    versa. Dit gaat door tot een oplossing is gevonden of tot een maximum van 10
-    iteraties niet tot een oplossing heeft geleid.
-
-    Args:
-        dm (DStabilityModel): _description_
-        sf (float): _description_
-
-    Returns:
-        bool: _description_
-    """
-    slope = 1.0
-    iterations = 0
-
-    # gebruik het laatste punt van de surface als polderpeil
-    z_polderpeil = dm.surface[-1][1]
-    # als we een sloot hebben gebruikt dan het hoge punt aan de landzijde als polderniveau
-    if dm.datastructure.scenarios[0].Stages[0].WaternetCreatorSettingsId is not None:
-        for wn in dm.datastructure.waternetcreatorsettings:
-            if (
-                wn.Id
-                == dm.datastructure.scenarios[0].Stages[0].WaternetCreatorSettingsId
-            ):
-                wnetcreator_settings = wn
-                break
-
-        try:
-            Ix = wnetcreator_settings.DitchCharacteristics.DitchLandSide
-            z_polderpeil - dm.z_at(Ix)
-        except Exception as e:
-            logging.info("No ditch land side point found.")
-
-    logging.info(
-        f"We gebruiken bij het minimaliseren van het profiel {z_polderpeil:.2f} als ontgravingspeil voor deze berekening"
-    )
-
-    while (
-        sf < REQUIRED_SF
-        or sf > REQUIRED_SF + FMIN_MARGIN
-        and iterations < MAX_ITERATIONS
-    ):
-        dmm = DStabilityModelModifier(
-            dm=dm,
-            phreatic_line_offset=PL_SURFACE_OFFSET,
-            polder_level=POLDERPEIL,
-        )
-        dmm.initialize()
-
-        #
-        cut_line = [(dm.xmin, dth), (0.0, dth), (crest_width, dth)]
-        dz = dth - polder_level + polder_level_offset
-        cut_line += [
-            (crest_width + dz * slope, polder_level + polder_level_offset),
-            (dm.xmax, polder_level + polder_level_offset),
-        ]
-
-        dmm.cut(cut_line)
-        dm_cut = dmm.to_dstability_model()
-        if dm_cut is None:
-            logging.error(
-                "Fout in het genereren van de berekening voor het minimale profiel. Check de log."
-            )
-            return None
-
-        try:
-            dm_cut.serialize(
-                Path(CALCULATIONS_PATH) / f"{stix_file.stem}_slope_{slope:.2f}.stix"
-            )
-            dm_cut.execute()
-            sf = round(dm_cut.get_result(0, 0).FactorOfSafety, 2)
-            logging.info(
-                f"Bij een helling van 1:{slope:.2f} is de veiligheidsfactor {sf:.3f}."
-            )
-        except Exception as e:
-            logging.error(
-                f"Fout bij het berekenen van de berm met helling 1:{slope:.2f}; '{e}'"
-            )
-            continue
-
-        if sf < REQUIRED_SF or sf > REQUIRED_SF + FMIN_MARGIN:
-            slope *= (REQUIRED_SF / sf) * 1.1
-
-        iterations += 1
-
-    if iterations == MAX_ITERATIONS:
-        logging.info(
-            "Na het maximale aantal iteraties is er nog geen oplossing gekomen waarbij voldaan wordt aan de vereiste veiligheidsfactor met marge."
-        )
-        return None
-
-    if dm_cut is None:
-        logging.error(
-            "Er is een fout aangetroffen waardoor dit bestand niet berekend kan worden."
-        )
-        return None
-
-    logging.info(f"Er is een oplossing gevonden met helling 1:{slope:.2f}")
-    dm_cut.serialize(solution_file)
-
-    return dm_cut
-
-
-# setup logging
 logging.basicConfig(
     filename=LOG_FILE_LEGGER,
     filemode="w",
@@ -186,22 +67,21 @@ logging.info(
     f"NB. Er wordt GEEN rekening gehouden met het verloop van de stijghoogte naar de freatische lijn."
 )
 
-# get the stix files
 stix_files = case_insensitive_glob(PATH_STIX_FILES, ".stix")
 
-# there we go
-for stix_file in stix_files[:10]:
-    # check if we already have a solution
+for stix_file in stix_files:
     solution_file = Path(CALCULATIONS_PATH) / f"{stix_file.stem}.solution.stix"
-
     if solution_file.exists() and not FORCE_RECALCULATION:
         logging.info(
             f"Skipping {stix_file.stem} because a solution has already been found."
         )
         continue
 
-    # read the file
     logging.info(f"Handling {stix_file}")
+
+    #################
+    # READ THE FILE #
+    #################
     dm = DStabilityModel()
     try:
         dm.parse(Path(stix_file))
@@ -209,7 +89,9 @@ for stix_file in stix_files[:10]:
         logging.error(f"Cannot open file '{stix_file}', got error '{e}'")
         continue
 
-    # check if there is only 1 scenario and 1 stage
+    ############################################
+    # CHECK THE NUMBER OF SCENARIOS AND STAGES #
+    ############################################
     if len(dm.scenarios) > 1:
         logging.warning(
             "Dit bestand heeft meer dan 1 scenario, beperk de invoer tot 1 scenario. We rekenen wel door maar check de uitkomsten!"
@@ -219,79 +101,213 @@ for stix_file in stix_files[:10]:
             "Dit bestand heeft in het eerste scenario meer dan 1 stage, beperk de invoer tot 1 scenario met 1 stage. We rekenen wel door maar check de uitkomsten!"
         )
 
-    # bepaal de huidige veiligheidsfactor
+    ####################
+    # CHECK CURRENT SF #
+    ####################
     try:
         dm.execute()
         sf = round(dm.get_result(0, 0).FactorOfSafety, 2)
+        logging.info(f"De huidige veiligheidsfactor bedraagt {sf:.2f}")
     except Exception as e:
-        logging.error(f"Fout bij het berekenen; '{e}'")
-        continue
-
-    # RAPPORT paragraaf 4.2
-    # Stap 1
-    # Indien Fmin aan de norm voldoet dan is de uitkomst gelijk aan de huidige geometrie
-    if sf >= REQUIRED_SF and sf <= (REQUIRED_SF + FMIN_MARGIN):
-        logging.info(
-            f"De huidige geometrie heeft een veiligheidsfactor van {sf:.2f} en valt daarmee binnen de marge van {REQUIRED_SF:.2f} tot {(REQUIRED_SF + FMIN_MARGIN):.2f} waar de huidige geometrie de input voor de legger is."
+        logging.error(
+            f"Fout bij het berekenen van de originele veiligheidsfactor; '{e}'"
         )
         continue
 
-    if sf < REQUIRED_SF:
-        logging.info(
-            f"De huidige veilgheidsfactor {sf:.2f} is lager dan de vereiste veiligheidsfactor ({REQUIRED_SF:.2f})"
+    ########################################
+    # CHECK THE CURRENT CALCULATION METHOD #
+    ########################################
+    calc_settings = dm._get_calculation_settings(scenario_index=0, calculation_index=0)
+
+    if calc_settings.AnalysisType == AnalysisTypeEnum.SPENCER_GENETIC:
+        logging.warning(
+            f"Het originele rekenmodel gebruikt Spencer Genetic, deze instellingen kunnen nog niet automatisch gegenereerd worden waardoor de leggerprofielen met Bishop Brute Force worden bepaald."
         )
-        dm = maximize_levee(dm, sf)
-        if dm is None:
-            logging.info(
-                "Het is niet gelukt om de dijk te laten voldoen aan de vereiste veiligheidsfactor, zie bovenstaande log entries."
-            )
-            continue
-    elif sf > REQUIRED_SF + FMIN_MARGIN:
-        logging.info(
-            f"De huidige veiligheidsfactor ({sf:.2f}) is groter dan de vereiste veiligheids factor + marge ({(REQUIRED_SF + FMIN_MARGIN):.2f}) wat aangeeft dat de dijk overgedimensioneerd is."
+    elif calc_settings.AnalysisType == AnalysisTypeEnum.UPLIFT_VAN_PARTICLE_SWARM:
+        logging.warning(
+            f"Het originele rekenmodel gebruikt Uplift Van Particle Swarm, deze instellingen kunnen nog niet automatisch gegenereerd worden waardoor de leggerprofielen met Bishop Brute Force worden bepaald."
         )
-        logging.info("Proces om de dijk af te minimaliseren is begonnen...")
+    elif calc_settings.AnalysisType != AnalysisTypeEnum.BISHOP_BRUTE_FORCE:
+        logging.error(
+            "Niet ondersteund type berekening (geen bishof brute force, spencer genetic of uplift van particle swarm)"
+        )
+        continue
 
-        # TODO constants should be from shape file
-        dm = minimize_levee(dm, sf, DTH, CREST_WIDTH, POLDERPEIL)
+    ##########################################
+    # TODO -> GET THE CALCULATION PARAMETERS #
+    ##########################################
+    dth = DTH
+    crest_width = CREST_WIDTH
+    river_level = RIVER_LEVEL
+    polder_level = POLDER_LEVEL
+    required_sf = REQUIRED_SF
 
-        if dm is None:
-            logging.info(
-                "Het is niet gelukt om de dijk te minimaliseren, zie bovenstaande log entries."
+    # make sure to add the ophoogmateriaal to the model
+    # TODO dit is een setting
+    soil = Soil()
+    soil.code = "Ophoogmateriaal"
+    soil.name = "Ophoogmateriaal"
+    soil.shear_strength_model_above_phreatic_level = "Mohr_Coulomb"
+    soil.shear_strength_model_below_phreatic_level = "Mohr_Coulomb"
+    soil.soil_weight_parameters.saturated_weight.mean = 15.0
+    soil.soil_weight_parameters.unsaturated_weight.mean = 15.0
+    soil.mohr_coulomb_parameters.cohesion = 2.0
+    soil.mohr_coulomb_parameters.friction_angle = 22.0
+    soil.mohr_coulomb_parameters.dilatancy_angle = 22.0
+    dm.add_soil(soil)
+
+    ##########################
+    # ITERATE OVER SOLUTIONS #
+    ##########################
+    slope = INITIAL_SLOPE
+    iteration = 1
+    solution = None
+    done = False
+    while not done:
+        logging.info(
+            f"Generating and calculating iteration {iteration} with slope {slope:.2f}"
+        )
+
+        dm_copy = deepcopy(dm)
+        x1 = dm_copy.xmin
+        z1 = dth
+        x2 = CREST_WIDTH  # we expect the reference line to be on x=0.0, TODO > check?
+        z2 = dth
+        x4 = dm_copy.xmax
+        z4 = dm_copy.surface[-1][
+            1
+        ]  # we assume the polder level is the same as the last point of the surface
+        z3 = z4
+        x3 = x2 + (z2 - z3) * slope
+
+        profile_line = [(x1, z1), (x2, z2), (x3, z3), (x4, z4)]
+
+        # if we have a ditch we need to add this too using the same distance from
+        # toe levee to top ditch water side and the same ditch geometry
+        if len(dm_copy.ditch_points) == 4:
+            pt_embankement_toe_land_side = dm_copy.get_characteristic_point(
+                CharacteristicPointEnum.EMBANKEMENT_TOE_LAND_SIDE
             )
-            continue
 
+            if pt_embankement_toe_land_side is None:
+                logging.error(
+                    "Er is een sloot gedefinieerd maar er is geen binnenteen punt gedefinieerd waardoor de afstand tussen de sloot en de binnenteen onbekend is"
+                )
+                continue
+
+            # original distance from toe levee to ditch
+            dx = dm_copy.ditch_points[0][0] - pt_embankement_toe_land_side.x
+
+            d1x = x3 + dx
+            d1z = dm_copy.ditch_points[0][1]
+            d2x = d1x + dm.ditch_points[1][0] - dm_copy.ditch_points[0][0]
+            d2z = dm_copy.ditch_points[1][1]
+            d3x = d2x + dm.ditch_points[2][0] - dm_copy.ditch_points[1][0]
+            d3z = dm_copy.ditch_points[2][1]
+            d4x = d3x + dm.ditch_points[3][0] - dm_copy.ditch_points[2][0]
+            d4z = dm_copy.ditch_points[3][1]
+
+            # check if we need to move x4
+            if x4 < d4x:
+                x4 = d4x + 1.0
+
+            profile_line = (
+                profile_line[:3]
+                + [(d1x, d1z), (d2x, d2z), (d3x, d3z), (d4x, d4z)]
+                + [profile_line[-1]]
+            )
+
+        # create a plot for debugging purposes
+        # fig, ax = plt.subplots(figsize=(15, 5))
+        # ax.plot([p[0] for p in dm.surface], [p[1] for p in dm.surface], "k")
+        # ax.plot([p[0] for p in profile_line], [p[1] for p in profile_line], "r")
+        # ax.set_aspect("equal", adjustable="box")
+        # fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}.profile_line.png")
+
+        # create the model
+        dmm = DStabilityModelModifier(
+            dm=dm_copy,
+        )
+        dmm.initialize()
+        dmm.cut(profile_line)
+        dmm.fill(
+            line=profile_line,
+            soil_code="Ophoogmateriaal",
+        )
+
+        # generate the phreatic line
+        plline_points = [
+            (x1, river_level),
+            (0, river_level),
+            (1.0, river_level - 1.0),
+            (x2, river_level - 1.2),
+            (x3, polder_level),
+            (x4, polder_level),
+        ]
+        dmm.set_phreatic_line(plline_points)
+
+        # dmm.set_phreatic_line()
+        dm_iteration = dmm.to_dstability_model_with_autogenerated_settings(
+            point_ref=(0, dth),
+            point_crest_land=(x2, z2),
+            point_toe=(x3, z3),
+            ditch_points=dm_copy.ditch_points,
+        )
+
+        dm_iteration.serialize(
+            Path(CALCULATIONS_PATH)
+            / f"{stix_file.stem}_iteration_{iteration}_slope_{slope:.2f}.stix"
+        )
+
+        try:
+            dm_iteration.execute()
+            sf = round(dm_iteration.get_result(0, 0).FactorOfSafety, 2)
+        except Exception as e:
+            logging.error(f"Could not calculate slope {slope:.2f}, got error {e}")
+
+        if sf >= required_sf and sf <= required_sf + SF_MARGIN:
+            logging.info(
+                f"Found a solution after {iteration} iteration(s) with slope=1:{slope:.2f}"
+            )
+            solution = dm_iteration
+            done = True
+        elif sf < required_sf:
+            slope *= 1.2
+        else:
+            slope /= 1.1
+
+        iteration += 1
+
+        if not done and iteration > MAX_ITERATIONS:
+            logging.error(
+                f"After {MAX_ITERATIONS} iterations we still have no solution, skipping this levee"
+            )
+            done = True
+            break
+
+    if solution is None:
+        continue
+
+    # get uittrede punt
+    x_uittredepunt = solution.datastructure.bishop_bruteforce_results[0].Points[-1].X
+    # get the remaining profile based on the slopes of the soils at x_uittredepunt
+    # NOTE that we only use the soils directly under x_uittredepunt for the slopes
+    # any changes in soil layers to the right of x_uittredepunt are ignored
+    # TODO > can be optimized
+    natural_slopes_line = get_natural_slopes_line(solution, x_uittredepunt)
+
+    # create the final line
+    final_line = [p for p in solution.surface if p[0] < x_uittredepunt]
+    final_line += natural_slopes_line
+
+    # plot the solution
     fig, ax = plt.subplots(figsize=(15, 5))
-    # create the line of the surface
     ax.plot([p[0] for p in dm.surface], [p[1] for p in dm.surface], "k")
+    ax.plot([p[0] for p in final_line], [p[1] for p in final_line], "k--")
+    fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}_solution.png")
 
-    # uittredepunt = get_uittredepunt(dm=dm)
-    # # maak hellingen conform grondopbouw op uittredepunt
-    # slopes_line = get_natural_slopes_line(dm, uittredepunt)
-    # ax.plot([p[0] for p in slopes_line], [p[1] for p in slopes_line], "k--")
-
-    # excavation_level = POLDERPEIL - EXCAVATION_DEPTH
-    # start_excavation = left
-    # for i in range(1, len(slopes_line)):
-    #     x1, z1 = slopes_line[i - 1]
-    #     x2, z2 = slopes_line[i]
-
-    #     if z1 >= excavation_level and excavation_level >= z2:
-    #         start_excavation = x1 + (z1 - excavation_level) / (z1 - z2) * (x2 - x1)
-    #         ax.plot(
-    #             [start_excavation, start_excavation],
-    #             [POLDERPEIL, excavation_level],
-    #             "k--",
-    #         )
-    #         logging.info(
-    #             f"Het begin van de ontgravingsbak van {EXCAVATION_DEPTH:.2f}m ligt op x={start_excavation:.2f},z={excavation_level:.2f}"
-    #         )
-    #         break
-
-    # if start_excavation == left:
-    #     logging.info(
-    #         f"Geen snijpunt gevonden met de lijn van de grondsoorten en de ontgravingsbak."
-    #     )
-    #     continue
-
-    fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}.png")
+    # write a csv file
+    with open(Path(CSV_PATH) / f"{stix_file.stem}_solution.csv", "w") as f:
+        f.write("x,z\n")
+        for p in final_line:
+            f.write("{p[0]:.2f},{p[1]:.2f}\n")

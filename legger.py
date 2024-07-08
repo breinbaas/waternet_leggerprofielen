@@ -25,6 +25,9 @@ PATH_STIX_FILES = (
 # output paths and files
 LOG_FILE_LEGGER = r"Z:\Documents\Klanten\Output\Waternet\Legger\Log\legger.log"
 CALCULATIONS_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\calculations"
+CALCULATION_ERRORS_PATH = (
+    r"Z:\Documents\Klanten\Output\Waternet\Legger\calculations\errors"
+)
 PLOT_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\Plots"
 CSV_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\csv"
 
@@ -264,6 +267,10 @@ for stix_file in stix_files:
             sf = round(dm_iteration.get_result(0, 0).FactorOfSafety, 2)
         except Exception as e:
             logging.error(f"Could not calculate slope {slope:.2f}, got error {e}")
+            dm_iteration.serialize(
+                Path(CALCULATION_ERRORS_PATH)
+                / f"{stix_file.stem}_iteration_{iteration}_slope_{slope:.2f}.stix"
+            )
 
         if sf >= required_sf and sf <= required_sf + SF_MARGIN:
             logging.info(

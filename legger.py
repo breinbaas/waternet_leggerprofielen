@@ -1,4 +1,6 @@
 import logging
+import os
+import glob
 from pathlib import Path
 from geolib.models.dstability import DStabilityModel
 from geolib.models.dstability.dstability_model import CharacteristicPointEnum
@@ -30,6 +32,7 @@ CALCULATION_ERRORS_PATH = (
 )
 PLOT_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\Plots"
 CSV_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\csv"
+SOLUTIONS_PATH = r"Z:\Documents\Klanten\Output\Waternet\Legger\solutions"
 
 # settings
 MIN_SLIP_PLANE_LENGTH = 3.0
@@ -71,6 +74,17 @@ logging.info(
 )
 
 stix_files = case_insensitive_glob(PATH_STIX_FILES, ".stix")
+
+# remove all the generated files
+# TODO > maybe not remove the solutions and check this to avoid calculating where
+# we already have a solution
+files = glob.glob(f"{CALCULATION_ERRORS_PATH}/*.stix")
+files += glob.glob(f"{CALCULATIONS_PATH}/*.stix")
+files += glob.glob(f"{PLOT_PATH}/*.png")
+files += glob.glob(f"{CSV_PATH}/*.csv")
+files += glob.glob(f"{SOLUTIONS_PATH}/*.stix")
+for f in files:
+    os.remove(f)
 
 for stix_file in stix_files:
     solution_file = Path(CALCULATIONS_PATH) / f"{stix_file.stem}.solution.stix"
@@ -115,6 +129,7 @@ for stix_file in stix_files:
         logging.error(
             f"Fout bij het berekenen van de originele veiligheidsfactor; '{e}'"
         )
+        dm_iteration.serialize(Path(CALCULATION_ERRORS_PATH) / f"{stix_file.stem}.stix")
         continue
 
     ########################################
@@ -185,47 +200,55 @@ for stix_file in stix_files:
 
         profile_line = [(x1, z1), (x2, z2), (x3, z3), (x4, z4)]
 
-        # if we have a ditch we need to add this too using the same distance from
-        # toe levee to top ditch water side and the same ditch geometry
+        # if we have a ditch add it to the new profile
         if len(dm_copy.ditch_points) == 4:
-            pt_embankement_toe_land_side = dm_copy.get_characteristic_point(
-                CharacteristicPointEnum.EMBANKEMENT_TOE_LAND_SIDE
-            )
+            new_ditch_points = []
+            dp = dm_copy.ditch_points
 
-            if pt_embankement_toe_land_side is None:
-                logging.error(
-                    "Er is een sloot gedefinieerd maar er is geen binnenteen punt gedefinieerd waardoor de afstand tussen de sloot en de binnenteen onbekend is"
-                )
-                continue
+            # check if the ditch bottom is above z3, if so skip the ditch
+            ditch_zmin = min([p[1] for p in dp])
+            if ditch_zmin >= z3:
+                break  # no need to add the ditch because the original bottom is above the new polderlevel
 
-            # original distance from toe levee to ditch
-            dx = dm_copy.ditch_points[0][0] - pt_embankement_toe_land_side.x
+            # get the original slopes
+            slope_left = (dp[1][0] - dp[0][0]) / (dp[0][1] - dp[1][1])
+            slope_right = (dp[-1][0] - dp[-2][0]) / (dp[-1][1] - dp[-2][1])
+            # and the original width
+            ditch_width = dp[2][0] - dp[1][0]
 
-            d1x = x3 + dx
-            d1z = dm_copy.ditch_points[0][1]
-            d2x = d1x + dm.ditch_points[1][0] - dm_copy.ditch_points[0][0]
-            d2z = dm_copy.ditch_points[1][1]
-            d3x = d2x + dm.ditch_points[2][0] - dm_copy.ditch_points[1][0]
-            d3z = dm_copy.ditch_points[2][1]
-            d4x = d3x + dm.ditch_points[3][0] - dm_copy.ditch_points[2][0]
-            d4z = dm_copy.ditch_points[3][1]
+            # if we pass the original ditch we need to move the ditch
+            if x3 > dp[0][0] - 0.1:
+                xs = x3 + 0.1
+            else:
+                xs = dp[0][0]
 
-            # check if we need to move x4
-            if x4 < d4x:
-                x4 = d4x + 1.0
+            xd1 = xs
+            zd1 = z3
+            zd2 = dp[1][1]
+            xd2 = xd1 + slope_left * (zd1 - zd2)
+            xd3 = xd2 + ditch_width
+            zd3 = dp[2][1]
+            zd4 = z4
+            xd4 = xd3 + slope_right * (zd4 - zd3)
 
-            profile_line = (
-                profile_line[:3]
-                + [(d1x, d1z), (d2x, d2z), (d3x, d3z), (d4x, d4z)]
-                + [profile_line[-1]]
-            )
+            # check if we did not pass x4, if so adjust x4
+            if xd4 >= x4:
+                x4 = xd4 + 0.1
+
+            profile_line = profile_line[:3] + [
+                (xd1, zd1),
+                (xd2, zd2),
+                (xd3, zd3),
+                (xd4, zd4),
+                (x4, z4),
+            ]
 
         # create a plot for debugging purposes
         # fig, ax = plt.subplots(figsize=(15, 5))
         # ax.plot([p[0] for p in dm.surface], [p[1] for p in dm.surface], "k")
         # ax.plot([p[0] for p in profile_line], [p[1] for p in profile_line], "r")
         # ax.set_aspect("equal", adjustable="box")
-        # fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}.profile_line.png")
+        # fig.savefig(Path(PLOT_PATH) / f"{stix_file.stem}.profile_line_{slope:.2f}.png")
 
         # create the model
         dmm = DStabilityModelModifier(
@@ -302,9 +325,13 @@ for stix_file in stix_files:
     # any changes in soil layers to the right of x_uittredepunt are ignored
     # TODO > can be optimized
     natural_slopes_line = get_natural_slopes_line(solution, x_uittredepunt)
+    natural_slopes_line_left = [
+        (-1 * p[0], p[1]) for p in get_natural_slopes_line(solution, 0)
+    ]
 
     # create the final line
-    final_line = [p for p in solution.surface if p[0] < x_uittredepunt]
+    final_line = natural_slopes_line_left[::-1]
+    final_line += [p for p in solution.surface if p[0] > 0.0 and p[0] < x_uittredepunt]
     final_line += natural_slopes_line
 
     # plot the solution
@@ -318,3 +345,5 @@ for stix_file in stix_files:
         f.write("x,z\n")
         for p in final_line:
             f.write("{p[0]:.2f},{p[1]:.2f}\n")
+
+    solution.serialize(Path(SOLUTIONS_PATH) / f"{stix_file.stem}_solution.stix")
